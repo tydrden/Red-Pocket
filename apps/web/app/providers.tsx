@@ -21,7 +21,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 supportedChains: [tempoTestnet],
                 loginMethods: ['email', 'wallet', 'google', 'twitter', 'discord', 'github', 'apple', 'linkedin', 'tiktok', 'farcaster', 'sms', 'passkey'],
                 embeddedWallets: {
-                    createOnLogin: 'all-users',
+                    createOnLogin: 'users-without-wallets',
                 },
             }}
         >
