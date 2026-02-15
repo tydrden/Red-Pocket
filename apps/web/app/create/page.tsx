@@ -207,6 +207,7 @@ export default function CreatePage() {
             if (!packetCreatedLog) throw new Error('Packet creation event not found');
 
             const packetId = packetCreatedLog.topics[1];
+            if (!packetId) throw new Error('Packet ID not found in logs');
 
             // 4. Generate Link
             // Encode packetId and privateKey to Base64 to make the link shorter
