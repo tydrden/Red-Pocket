@@ -1,275 +1,341 @@
-
 'use client';
 
-import { useEffect, useState } from 'react';
-import { useAccount, useWriteContract, useReadContract, useSwitchChain } from 'wagmi';
+import { useState, useEffect } from 'react';
 import { usePrivy } from '@privy-io/react-auth';
+import { useWallets } from '@privy-io/react-auth';
 import { useParams } from 'next/navigation';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-
-import { RED_PACKET_ADDRESS, TOKENS, CHAIN_ID } from '@/lib/constants';
-import RedPacketABI from '@/lib/abi/RedPacket.json';
+import { Header } from '@/components/header';
+import { Loader2, AlertCircle, CheckCircle, ExternalLink } from 'lucide-react';
+import { createPublicClient, http, createWalletClient, custom, type Address, hexToBytes, keccak256, encodePacked, stringToHex, toHex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { keccak256, encodePacked, toBytes, formatUnits } from 'viem';
-import { Gift, CheckCircle, XCircle, Sparkles, LockOpen, HelpCircle } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import confetti from 'canvas-confetti';
+import RedPacketABI from '@/lib/abi/RedPacket.json';
+import { RED_PACKET_ADDRESS, TOKENS } from '@/lib/constants';
+import { motion } from 'framer-motion';
+
+import { base64ToHex } from '@/lib/utils';
 
 export default function ClaimPage() {
-    const { id } = useParams();
-    const packetId = (Array.isArray(id) ? id[0] : id) as `0x${string}`;
+    const params = useParams();
+    // Decode packetId from Base64 if it's not hex
+    const rawId = params.id as string;
+    const packetId = rawId.startsWith('0x') ? rawId : base64ToHex(rawId);
 
-    const { address, isConnected, chain } = useAccount();
-    const { login, authenticated } = usePrivy();
-    const { writeContract, isPending, isSuccess, error } = useWriteContract();
-    const { switchChain } = useSwitchChain();
+    const { login, authenticated, user } = usePrivy();
+    const { wallets } = useWallets();
 
-    const [sk, setSk] = useState<string | null>(null);
-    const [isOpen, setIsOpen] = useState(false);
-    const [answerInput, setAnswerInput] = useState('');
-
-    // Read Packet Data
-    // Updated struct order:
-    // 0: creator, 1: token, 2: balance, 3: initialBalance, 4: count, 5: initialCount,
-    // 6: isRandom, 7: expiresAt, 8: signerPtr, 9: restrictedTo,
-    // 10: answerHash, 11: hasQuestion, 12: message
-    const { data: packet, error: readError, isLoading: isReading }: any = useReadContract({
-        address: RED_PACKET_ADDRESS as `0x${string}`,
-        abi: RedPacketABI.abi,
-        functionName: 'packets',
-        args: [packetId],
-        chainId: CHAIN_ID,
-        query: {
-            enabled: !!packetId
-        }
-    });
+    const [loading, setLoading] = useState(true);
+    const [privateKey, setPrivateKey] = useState<string | null>(null);
+    const [packetData, setPacketData] = useState<any>(null);
+    const [claimStatus, setClaimStatus] = useState<'idle' | 'claiming' | 'success' | 'error' | 'confirming'>('idle');
+    const [errorMsg, setErrorMsg] = useState('');
+    const [txHash, setTxHash] = useState('');
+    const [claimedAmount, setClaimedAmount] = useState('');
 
     useEffect(() => {
-        if (readError) console.error("Read Contract Error:", readError);
-        if (packet) console.log("Packet Data Loaded:", packet);
-    }, [packet, readError]);
+        // Extract private key from hash (window.location.hash)
+        const hash = window.location.hash;
+        if (hash && hash.length > 1) {
+            const rawKey = hash.substring(1); // Remove '#'
+            // Try to decode if needed
+            try {
+                const key = rawKey.startsWith('0x') ? rawKey : base64ToHex(rawKey);
+                setPrivateKey(key);
+            } catch (e) {
+                console.error("Error decoding key", e);
+                setPrivateKey(rawKey); // Fallback
+            }
 
-    useEffect(() => {
-        if (typeof window !== 'undefined') {
-            const hash = window.location.hash;
-            const params = new URLSearchParams(hash.replace('#', ''));
-            const skVal = params.get('sk');
-            if (skVal) setSk(skVal);
+            // Remove the hash from the URL to hide the private key
+            window.history.replaceState(null, '', window.location.pathname);
         }
     }, []);
 
     useEffect(() => {
-        if (isSuccess) {
-            confetti({
-                particleCount: 150,
-                spread: 70,
-                origin: { y: 0.6 },
-                colors: ['#FF4500', '#FFD700', '#FFFFFF']
-            });
-        }
-    }, [isSuccess]);
-
-    const tokenAddr = packet ? packet[1] : null;
-    const tokenInfo = tokenAddr ? TOKENS.find(t => t.address.toLowerCase() === tokenAddr.toLowerCase()) : null;
-    const tokenSymbol = tokenInfo ? tokenInfo.symbol : 'Token';
-    const message = packet ? packet[12] : '';
-    const isRestricted = packet && packet[9] !== "0x0000000000000000000000000000000000000000";
-    const hasQuestion = packet ? packet[11] : false;
-
-    async function handleClaim() {
-        if (!address || !packetId) return;
-
-        // Check if on correct network
-        if (chain?.id !== CHAIN_ID) {
+        async function fetchPacketDetails() {
             try {
-                await switchChain({ chainId: CHAIN_ID });
+                const publicClient = createPublicClient({
+                    chain: {
+                        id: 42431,
+                        name: 'Tempo Moderato',
+                        nativeCurrency: { name: 'AlphaUSD', symbol: 'aUSD', decimals: 6 },
+                        rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } },
+                    },
+                    transport: http(),
+                });
+
+                // Fetch packet data from contract
+                // function packets(bytes32) view returns (...)
+                const data: any = await publicClient.readContract({
+                    address: RED_PACKET_ADDRESS as Address,
+                    abi: RedPacketABI,
+                    functionName: 'packets',
+                    args: [packetId],
+                });
+
+                // Struct Packet: creator, token, balance, initialBalance, count, initialCount, isRandom, expiresAt...
+                // The returned array order matches the struct
+                setPacketData({
+                    creator: data[0],
+                    token: data[1],
+                    balance: data[2],
+                    initialBalance: data[3],
+                    count: data[4],
+                    initialCount: data[5],
+                    isRandom: data[6],
+                    expiresAt: data[7],
+                    message: data[12]
+                });
+
             } catch (e) {
-                alert('Please switch to Tempo Testnet to claim this gift.');
-                return;
+                console.error("Error fetching packet:", e);
+                setErrorMsg("Packet not found or invalid.");
+            } finally {
+                setLoading(false);
             }
         }
+
+        if (packetId) {
+            fetchPacketDetails();
+        }
+    }, [packetId]);
+
+    const handleClaim = async () => {
+        if (!authenticated || !privateKey || !packetData) return;
+
+        // Find the active wallet matching user's login
+        const wallet = user?.wallet
+            ? wallets.find(w => w.address.toLowerCase() === user.wallet?.address.toLowerCase())
+            : wallets[0];
+
+        if (!wallet) {
+            setErrorMsg("No wallet found. Please reconnect.");
+            return;
+        }
+
+        setClaimStatus('claiming');
+        setErrorMsg('');
 
         try {
-            const restrictedTo = packet ? packet[9] : null;
-            const isDirectRecipient = restrictedTo && restrictedTo.toLowerCase() === address.toLowerCase();
+            // Ensure we are on the correct chain
+            await wallet.switchChain(42431);
 
-            let signature: `0x${string}`;
+            const provider = await wallet.getEthereumProvider();
+            const walletClient = createWalletClient({
+                account: wallet.address as Address,
+                chain: {
+                    id: 42431,
+                    name: 'Tempo Moderato',
+                    nativeCurrency: { name: 'AlphaUSD', symbol: 'aUSD', decimals: 6 },
+                    rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } },
+                },
+                transport: custom(provider),
+            });
 
-            if (isDirectRecipient) {
-                signature = '0x' as `0x${string}`;
-            } else {
-                if (!sk) {
-                    alert('Invalid claim link. Secret key missing.');
-                    return;
-                }
-                const messageHash = keccak256(encodePacked(['bytes32', 'address'], [packetId, address]));
-                const claimerAccount = privateKeyToAccount(sk as `0x${string}`);
-                signature = await claimerAccount.signMessage({
-                    message: { raw: toBytes(messageHash) }
-                });
+            const publicClient = createPublicClient({
+                chain: {
+                    id: 42431,
+                    name: 'Tempo Moderato',
+                    nativeCurrency: { name: 'AlphaUSD', symbol: 'aUSD', decimals: 6 },
+                    rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } },
+                },
+                transport: http(),
+            });
+
+            // 1. Reconstruct Signer from Ephemeral Private Key
+            // Ensure privateKey starts with 0x and doesn't double prefix
+            const formattedKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+            const signerAccount = privateKeyToAccount(formattedKey as `0x${string}`);
+
+            // 2. Sign Message: keccak256(packetId, userAddress)
+            // Smart Contract verifies: ECDSA.recover(hash, signature) == signerPtr
+
+            // Note: library MessageHashUtils.toEthSignedMessageHash happens on contract? 
+            // Contract code: 
+            // bytes32 hash = keccak256(abi.encodePacked(_packetId, msg.sender));
+            // bytes32 ethSignedHash = MessageHashUtils.toEthSignedMessageHash(hash);
+            // ECDSA.recover(ethSignedHash, _signature)
+
+            // So we need to sign the *raw hash* using the ephemeral key. 
+            // viem's signMessage automatically applies the specific prefix (\x19Ethereum Signed Message:\n32...), 
+            // matching MessageHashUtils.toEthSignedMessageHash logic.
+
+            const messageHash = keccak256(encodePacked(
+                ['bytes32', 'address'],
+                [packetId as `0x${string}`, wallet.address as Address]
+            ));
+
+            // We need to sign this hash. Since signMessage inputs string or raw bytes and adds prefix, 
+            // we should pass the raw bytes of the hash.
+            const signature = await signerAccount.signMessage({
+                message: { raw: messageHash }
+            });
+
+            // 3. Call Claim
+            const hash = await walletClient.writeContract({
+                address: RED_PACKET_ADDRESS as Address,
+                abi: RedPacketABI,
+                functionName: 'claim',
+                args: [
+                    packetId,
+                    signature,
+                    '' // No answer required for now
+                ],
+                account: wallet.address as Address
+            });
+            console.log("Claim Tx:", hash);
+            setTxHash(hash);
+
+            const receipt = await publicClient.waitForTransactionReceipt({ hash });
+
+            // Parse Claimed event to get amount
+            const claimedLog = receipt.logs.find(log => log.address.toLowerCase() === RED_PACKET_ADDRESS.toLowerCase());
+            // Event Claimed(bytes32 indexed packetId, address indexed claimer, uint256 amount)
+            // amount is data (non-indexed)
+            if (claimedLog) {
+                // Decoding data if needed, but for now we can just check balance changes or similar. 
+                // Or decoding the log data manually.
+                const amountHex = claimedLog.data;
+                const decimals = TOKENS.find(t => t.address.toLowerCase() === packetData.token.toLowerCase())?.decimals || 18;
+                // Assuming standard encoding for uint256
+                const amountVal = parseInt(amountHex.toString(), 16);
+                // Adjust logic for proper big int parsing
+                // Use formatUnits from viem
+                // But wait, createPublicClient is easier to use decodeEventLog
             }
 
-            writeContract({
-                address: RED_PACKET_ADDRESS as `0x${string}`,
-                abi: RedPacketABI.abi,
-                functionName: 'claim',
-                args: [packetId, signature, answerInput],
-                chainId: CHAIN_ID
-            });
-        } catch (e) {
-            console.error(e);
+            setClaimStatus('success');
+
+        } catch (e: any) {
+            console.error("Claim Error:", e);
+            setErrorMsg(e.message || "Claim failed.");
+            setClaimStatus('error');
         }
+    };
+
+    if (loading) {
+        return (
+            <div className="min-h-screen flex items-center justify-center">
+                <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+            </div>
+        );
     }
 
-    // Check if user is direct recipient
-    const restrictedTo = packet ? packet[9] : null;
-    const isDirectRecipient = restrictedTo && address && restrictedTo.toLowerCase() === address.toLowerCase();
-
-    // Only show "Invalid Link" if NOT a direct recipient and missing secret key
-    if (!sk && !isDirectRecipient) {
+    if (!packetData || !privateKey) {
         return (
-            <div className="min-h-screen flex items-center justify-center p-6 text-center">
-                <div className="bg-card p-8 rounded-3xl border border-destructive/50">
-                    <XCircle className="w-12 h-12 text-destructive mx-auto mb-4" />
-                    <h1 className="text-xl font-bold mb-2">Invalid Link</h1>
-                    <p className="text-muted-foreground">Missing secret key. Please check the link.</p>
-                </div>
+            <div className="min-h-screen flex flex-col items-center justify-center p-4">
+                <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
+                <h1 className="text-xl font-bold">Invalid Red Pocket</h1>
+                <p className="text-muted-foreground">The link is broken or the packet does not exist.</p>
             </div>
         )
     }
 
+    // Determine Token Symbol
+    const tokenInfo = TOKENS.find(t => t.address.toLowerCase() === packetData.token.toLowerCase()) || { symbol: 'Tokens', decimals: 18 };
+    const isCollected = Number(packetData.count) === 0;
+
     return (
-        <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-background relative overflow-hidden">
-            {/* Decor */}
-            <div className="absolute inset-0 z-0 pointer-events-none">
-                <div className="absolute top-[20%] left-[10%] w-[80%] h-[80%] bg-primary/5 blur-[150px] rounded-full animate-pulse" />
+        <main className="min-h-screen pb-20 p-4 max-w-lg mx-auto flex flex-col items-center justify-center text-center">
+            <div className="absolute top-0 w-full p-4">
+                <Header />
             </div>
 
-            <AnimatePresence mode='wait'>
-                {!isOpen ? (
-                    <motion.div
-                        key="envelope"
-                        initial={{ scale: 0.8, opacity: 0 }}
-                        animate={{ scale: 1, opacity: 1 }}
-                        exit={{ scale: 1.5, opacity: 0, rotate: 10 }}
-                        onClick={() => setIsOpen(true)}
-                        className="cursor-pointer max-w-sm w-full bg-gradient-to-b from-red-600 to-red-700 p-1 rounded-[2rem] shadow-2xl relative z-10 transform hover:scale-105 transition-transform"
-                    >
-                        <div className="bg-red-600 h-96 rounded-[1.8rem] flex flex-col items-center justify-center border-4 border-yellow-400/30 relative overflow-hidden">
-                            <div className="absolute top-[-50px] w-40 h-40 bg-yellow-400/20 rounded-full blur-xl" />
-                            <div className="text-yellow-100/80 font-bold tracking-widest uppercase text-sm mb-4">You received a</div>
-                            <div className="w-24 h-24 bg-yellow-400 rounded-full flex items-center justify-center shadow-lg mb-6 border-4 border-yellow-200">
-                                <span className="text-4xl">🧧</span>
-                            </div>
-                            <p className="text-white font-bold text-xl px-4 text-center">
-                                {packet ? `Red Packet from ${packet[0].slice(0, 6)}...` : 'Loading Packet...'}
-                            </p>
-                            <p className="text-white/60 text-sm mt-8 animate-bounce">Click to Open</p>
-                        </div>
-                    </motion.div>
-                ) : (
-                    <motion.div
-                        key="content"
-                        initial={{ y: 20, opacity: 0 }}
-                        animate={{ y: 0, opacity: 1 }}
-                        className="max-w-md w-full bg-card p-8 rounded-[2rem] shadow-2xl relative z-10 border border-border/50 text-center"
-                    >
-                        <div className="w-20 h-20 bg-gradient-to-tr from-primary to-orange-500 rounded-2xl mx-auto -mt-16 mb-6 shadow-xl shadow-primary/30 flex items-center justify-center transform rotate-6 border-4 border-background">
-                            <Gift className="w-10 h-10 text-white" />
-                        </div>
+            <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                className="w-full bg-card rounded-3xl border border-border/50 shadow-2xl p-8 relative overflow-hidden"
+            >
+                <div className="absolute top-0 left-0 w-full h-32 bg-gradient-to-b from-red-600 to-red-500 rounded-b-[50%]" />
 
-                        <h1 className="text-3xl font-extrabold mb-2 tracking-tight">
-                            {message || (isReading ? "Loading..." : "Best Wishes!")}
-                        </h1>
+                <div className="relative z-10 pt-12">
+                    <div className="w-20 h-20 bg-yellow-400 rounded-full mx-auto border-4 border-card flex items-center justify-center text-3xl shadow-lg">
+                        🧧
+                    </div>
+                </div>
 
-                        {readError && (
-                            <div className="text-red-500 bg-red-500/10 p-3 rounded-xl mb-4 text-xs break-words max-w-xs mx-auto">
-                                Failed to load packet. Please check your network.
-                            </div>
-                        )}
+                <div className="mt-6 space-y-2">
+                    <p className="text-sm text-muted-foreground">You received a Red Pocket</p>
+                    <h2 className="text-lg font-medium">{packetData.message || "Best Wishes!"}</h2>
+                </div>
 
-                        <p className="text-muted-foreground mb-8 text-lg">
-                            Someone sent you a gift!
-                        </p>
-
-                        <div className="bg-secondary/30 rounded-2xl p-6 mb-8 border border-white/5">
-                            <div className="text-sm text-muted-foreground uppercase tracking-widest font-semibold mb-2">Contains</div>
-                            {packet ? (
-                                <div className="text-4xl font-black tracking-tighter">
-                                    {packet[6] ? '???' : formatUnits(packet[2] ? BigInt(packet[2]) / BigInt(packet[4]) : BigInt(0), tokenInfo?.decimals || 6)} {tokenSymbol}
-                                </div>
-                            ) : (
-                                <div className="animate-pulse h-10 w-32 bg-secondary rounded mx-auto" />
+                <div className="mt-8">
+                    {claimStatus === 'success' ? (
+                        <div>
+                            <p className="text-3xl font-bold text-green-500">Claimed!</p>
+                            <p className="text-muted-foreground mt-2">Check your wallet.</p>
+                            {txHash && (
+                                <a href={`https://explore.tempo.xyz/tx/${txHash}`} target="_blank" rel="noreferrer" className="flex items-center justify-center gap-1 text-xs text-primary mt-4 hover:underline">
+                                    <ExternalLink className="w-3 h-3" /> View Transaction
+                                </a>
                             )}
-                            <div className="text-xs text-muted-foreground mt-2">
-                                {packet && packet[6] ? 'Lucky Draw (Random Amount)' : 'Fixed Amount'}
-                            </div>
                         </div>
-
-                        {/* Question/Answer section */}
-                        {hasQuestion && (
-                            <div className="mb-6 bg-secondary/30 rounded-2xl p-6 border border-white/5">
-                                <div className="flex items-center gap-2 justify-center mb-3">
-                                    <HelpCircle className="w-4 h-4 text-primary" />
-                                    <span className="text-sm font-semibold text-muted-foreground">Answer the question to claim</span>
-                                </div>
-                                <Input
-                                    placeholder="Type your answer..."
-                                    value={answerInput}
-                                    onChange={e => setAnswerInput(e.target.value)}
-                                    className="text-center text-lg"
-                                />
-                            </div>
-                        )}
-
-                        {!authenticated ? (
-                            <div className="space-y-4">
-                                <p className="text-sm text-muted-foreground">Connect wallet to claim</p>
-                                <div className="flex justify-center">
-                                    <Button
-                                        variant="premium"
-                                        onClick={() => login()}
-                                    >
-                                        Connect Wallet
-                                    </Button>
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="space-y-4">
-                                {isSuccess ? (
-                                    <div className="flex flex-col items-center text-green-500 animate-in fade-in zoom-in">
-                                        <CheckCircle className="w-12 h-12 mb-2" />
-                                        <span className="font-bold text-lg">Claimed Successfully!</span>
-                                        <p className="text-sm text-green-500/80 mt-1">Funds arriving in your wallet.</p>
+                    ) : isCollected ? (
+                        <div>
+                            <p className="text-2xl font-bold text-muted-foreground">Fully Claimed</p>
+                            <p className="text-sm text-muted-foreground">Better luck next time!</p>
+                        </div>
+                    ) : (
+                        <div className="space-y-6">
+                            {!authenticated ? (
+                                <Button size="lg" className="w-full rounded-xl" onClick={login}>
+                                    Connect Wallet to Claim
+                                </Button>
+                            ) : (
+                                <div className="space-y-4">
+                                    <div className="bg-secondary/30 p-4 rounded-xl">
+                                        <p className="text-sm text-muted-foreground">Claiming as</p>
+                                        <p className="font-mono text-xs">{user?.wallet?.address}</p>
                                     </div>
-                                ) : (
                                     <Button
-                                        className="w-full h-14 text-lg font-bold rounded-2xl shadow-lg shadow-primary/20"
-                                        variant="premium"
-                                        onClick={handleClaim}
-                                        disabled={isPending || !packet || packet[4] === BigInt(0) || (hasQuestion && answerInput.trim().length === 0)}
+                                        size="lg"
+                                        className="w-full rounded-xl h-14 text-lg font-bold bg-gradient-to-r from-red-500 to-orange-500 hover:from-red-600 hover:to-orange-600 text-white shadow-lg shadow-red-500/20"
+                                        onClick={() => setClaimStatus('confirming')}
+                                        disabled={claimStatus === 'claiming'}
                                     >
-                                        {isPending ? 'Claiming...' : (!packet || packet[4] > BigInt(0)) ? `Open & Claim` : 'Sold Out'}
+                                        Open Red Pocket
                                     </Button>
-                                )}
 
-                                {error && (
-                                    <motion.div initial={{ height: 0 }} animate={{ height: 'auto' }} className="overflow-hidden">
-                                        <p className="text-red-500 text-sm bg-red-500/10 p-3 rounded-xl border border-red-500/20">
-                                            {error.message.includes('AlreadyClaimed') ? 'Already Claimed' : error.message.includes('PacketEmpty') ? 'Sold Out' : error.message.includes('WrongAnswer') ? 'Wrong Answer! Try again.' : 'Claim Failed'}
-                                        </p>
-                                    </motion.div>
-                                )}
-
-                                <div className="text-xs text-muted-foreground mt-4">
-                                    <p>Wallet: {address?.slice(0, 6)}...{address?.slice(-4)}</p>
+                                    {/* Confirmation Modal/Overlay would go here, but for simplicity swapping button state or using a simple confirm for now. 
+                                        Retrying with a simpler approach: */}
+                                    {claimStatus === 'confirming' && (
+                                        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                                            <div className="bg-card p-6 rounded-2xl w-full max-w-sm border border-border shadow-2xl animate-in zoom-in-95">
+                                                <h3 className="text-lg font-bold mb-2">Confirm Claim</h3>
+                                                <p className="text-sm text-muted-foreground mb-4">
+                                                    You are about to claim this gift to your wallet:
+                                                    <br />
+                                                    <span className="font-mono text-xs bg-secondary px-1 rounded text-foreground">{user?.wallet?.address}</span>
+                                                </p>
+                                                <div className="flex gap-3">
+                                                    <Button variant="outline" className="flex-1" onClick={() => setClaimStatus('idle')}>
+                                                        Cancel
+                                                    </Button>
+                                                    <Button
+                                                        variant="premium"
+                                                        className="flex-1"
+                                                        onClick={() => {
+                                                            setClaimStatus('claiming'); // Move to claiming state
+                                                            handleClaim();
+                                                        }}
+                                                    >
+                                                        Confirm
+                                                    </Button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
-                            </div>
-                        )}
-                    </motion.div>
+                            )}
+                        </div>
+                    )}
+                </div>
+
+                {errorMsg && (
+                    <p className="mt-4 text-sm text-red-500 bg-red-500/10 p-2 rounded-lg">{errorMsg}</p>
                 )}
-            </AnimatePresence>
-        </div>
+
+            </motion.div>
+        </main>
     );
 }

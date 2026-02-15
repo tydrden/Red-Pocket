@@ -2,7 +2,7 @@
 'use client';
 
 import { PrivyProvider } from '@privy-io/react-auth';
-import { WagmiProvider } from 'wagmi';
+import { WagmiProvider } from '@privy-io/wagmi';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { config, tempoTestnet } from '../lib/config';
 
@@ -19,14 +19,17 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 },
                 defaultChain: tempoTestnet,
                 supportedChains: [tempoTestnet],
-                loginMethods: ['email', 'wallet', 'google', 'sms'],
+                loginMethods: ['email', 'wallet', 'google', 'twitter', 'discord', 'github', 'apple', 'linkedin', 'tiktok', 'farcaster', 'sms', 'passkey'],
+                embeddedWallets: {
+                    createOnLogin: 'all-users',
+                },
             }}
         >
-            <WagmiProvider config={config}>
-                <QueryClientProvider client={queryClient}>
+            <QueryClientProvider client={queryClient}>
+                <WagmiProvider config={config}>
                     {children}
-                </QueryClientProvider>
-            </WagmiProvider>
+                </WagmiProvider>
+            </QueryClientProvider>
         </PrivyProvider>
     );
 }

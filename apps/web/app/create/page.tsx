@@ -1,216 +1,321 @@
 
 'use client';
 
+'use client';
+
 import { useState, useEffect } from 'react';
-import { useAccount, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { usePrivy } from '@privy-io/react-auth';
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { useWallets } from '@privy-io/react-auth';
 import { Button } from '@/components/ui/button';
 import { Header } from '@/components/header';
 import { Input } from '@/components/ui/input';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { Chip } from '@/components/ui/chip';
-import { RED_PACKET_ADDRESS, TOKENS, CHAIN_ID } from '@/lib/constants';
+import { TOKENS, RED_PACKET_ADDRESS } from '@/lib/constants';
+import { useSend } from '@/hooks/useSend';
 import RedPacketABI from '@/lib/abi/RedPacket.json';
+import { hexToBase64 } from '@/lib/utils';
 
-import { Loader2, Gift, CheckCircle, Settings2, Copy, Wallet, Share2, HelpCircle } from 'lucide-react';
-import { parseUnits, isAddress, keccak256, encodePacked } from 'viem';
+import { Loader2, Gift, CheckCircle, Settings2, Copy, Share2, HelpCircle, ExternalLink, Shuffle, Users } from 'lucide-react';
+import { isAddress, type Address, encodeFunctionData, parseUnits, createPublicClient, http, createWalletClient, custom } from 'viem';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ERC-20 ABI for approve
+// ERC20 ABI for Approve
 const ERC20_ABI = [
     {
         name: 'approve',
         type: 'function',
         stateMutability: 'nonpayable',
-        inputs: [
-            { name: 'spender', type: 'address' },
-            { name: 'amount', type: 'uint256' },
-        ],
-        outputs: [{ name: '', type: 'bool' }],
-    },
-    {
-        name: 'allowance',
-        type: 'function',
-        stateMutability: 'view',
-        inputs: [
-            { name: 'owner', type: 'address' },
-            { name: 'spender', type: 'address' },
-        ],
-        outputs: [{ name: '', type: 'uint256' }],
-    },
-] as const;
+        inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
+        outputs: [{ name: '', type: 'bool' }]
+    }
+];
 
 export default function CreatePage() {
-    const { isConnected, address, chainId } = useAccount();
     const { login, authenticated } = usePrivy();
-
-    // Approve transaction
-    const { writeContract: writeApprove, data: approveHash, isPending: isApprovePending } = useWriteContract();
-    const { isSuccess: isApproveConfirmed, isLoading: isApproveConfirming } = useWaitForTransactionReceipt({ hash: approveHash });
-
-    // Create packet transaction
-    const { writeContract, data: hash, isPending: isWritePending, error: writeError } = useWriteContract();
-    const { data: receipt, isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({ hash });
+    const { wallets } = useWallets();
+    const { send, isSending, error: sendError, txHash, walletAddress, reset } = useSend();
 
     const [mounted, setMounted] = useState(false);
     useEffect(() => setMounted(true), []);
 
     // Mode: 'single' | 'link'
-    const [mode, setMode] = useState('link');
+    const [mode, setMode] = useState('single');
 
     // Form State
-    const [token, setToken] = useState(TOKENS[0]); // Default AlphaUSD
+    const [token, setToken] = useState(TOKENS[0]);
     const [amount, setAmount] = useState('');
     const [recipient, setRecipient] = useState('');
-    const [count, setCount] = useState('1');
-    const [splitType, setSplitType] = useState<'equal' | 'random'>('equal');
     const [message, setMessage] = useState('');
-    const [expiry, setExpiry] = useState('24h');
 
-    // Q&A State
-    const [question, setQuestion] = useState('');
-    const [answer, setAnswer] = useState('');
-
-    // UI State
-    const [showAdvanced, setShowAdvanced] = useState(false);
-    const [createdPacketId, setCreatedPacketId] = useState<string | null>(null);
-    const [step, setStep] = useState<'form' | 'approving' | 'creating'>('form');
+    // Red Pocket State
+    const [count, setCount] = useState('5');
+    const [isRandom, setIsRandom] = useState(true);
+    const [createdLink, setCreatedLink] = useState('');
+    const [isCreating, setIsCreating] = useState(false);
+    const [createError, setCreateError] = useState('');
 
     // Constants
     const MESSAGES = ["Best Wishes! 🎁", "GM! ☀️", "Happy Birthday! 🎂", "Congrats! 🎉", "For Coffee ☕️"];
-    const EXPIRY_OPTIONS = [
-        { label: '24 Hours', value: '24h', seconds: 86400 },
-        { label: '7 Days', value: '7d', seconds: 604800 },
-        { label: '1 Hour', value: '1h', seconds: 3600 },
-    ];
-
-    // When approve is confirmed, proceed to create
-    useEffect(() => {
-        if (isApproveConfirmed && step === 'approving') {
-            setStep('creating');
-            executeCreate();
-        }
-    }, [isApproveConfirmed]);
-
-    // Capture Receipt Logs to find PacketID & Save to LocalStorage
-    useEffect(() => {
-        if (isSuccess && receipt) {
-            const log = receipt.logs.find(l => l.address.toLowerCase() === RED_PACKET_ADDRESS.toLowerCase());
-            if (log && log.topics[1]) {
-                const pId = log.topics[1];
-                setCreatedPacketId(pId);
-
-                // Save to LocalStorage
-                const sk = localStorage.getItem('pending_sk');
-                const savedPockets = JSON.parse(localStorage.getItem('my_pockets') || '[]');
-                const newPocket = {
-                    id: pId,
-                    amount: amount,
-                    token: token.symbol,
-                    count: count,
-                    claimedCount: 0,
-                    expiresAt: Date.now() + (EXPIRY_OPTIONS.find(e => e.value === expiry)?.seconds || 86400) * 1000,
-                    status: 'active',
-                    mode: mode,
-                    sk: sk,
-                    createdAt: Date.now(),
-                    hasQuestion: question.trim().length > 0,
-                    question: question.trim() || undefined,
-                };
-
-                if (!savedPockets.find((p: any) => p.id === pId)) {
-                    savedPockets.unshift(newPocket);
-                    localStorage.setItem('my_pockets', JSON.stringify(savedPockets));
-                }
-            }
-        }
-    }, [isSuccess, receipt, amount, token, count, mode, expiry, question]);
-
-    // State for pending create args
-    const [pendingCreateArgs, setPendingCreateArgs] = useState<any>(null);
-
-    function executeCreate() {
-        if (!pendingCreateArgs) return;
-        const { tokenAddress, parsedAmount, parsedCount, isRandom, pk, restrictedTo, duration, msg, answerHash } = pendingCreateArgs;
-
-        writeContract({
-            address: RED_PACKET_ADDRESS as `0x${string}`,
-            abi: RedPacketABI.abi,
-            functionName: 'createPacket',
-            args: [
-                tokenAddress,
-                parsedAmount,
-                parsedCount,
-                isRandom,
-                pk,
-                restrictedTo,
-                duration,
-                msg,
-                answerHash,
-            ],
-            chainId: CHAIN_ID,
-        });
-    }
 
     async function handleCreate() {
-        if (!isConnected) return;
-        try {
-            // 1. Generate Ephemeral Key
-            const sk = generatePrivateKey();
-            const account = privateKeyToAccount(sk);
-            const pk = account.address;
+        if (!authenticated) return;
+        setCreateError('');
 
-            // 2. Prepare Args
-            const parsedAmount = parseUnits(amount || '0', token.decimals);
-            const parsedCount = mode === 'single' ? 1n : BigInt(count || '1');
-            const isRandom = splitType === 'random' && mode === 'link';
-            let duration = BigInt(EXPIRY_OPTIONS.find(e => e.value === expiry)?.seconds || 86400);
-
-            const restrictedTo = mode === 'single' ? (recipient as `0x${string}`) : "0x0000000000000000000000000000000000000000";
-
-            // 3. Compute answer hash
-            let answerHash = "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`;
-            if (question.trim() && answer.trim()) {
-                answerHash = keccak256(encodePacked(['string'], [answer.toLowerCase().trim()]));
-            }
-
-            // 4. Save pending SK
-            localStorage.setItem('pending_sk', sk);
-            localStorage.setItem('pending_token', token.symbol);
-
-            // 5. Store create args for after approve
-            const createArgs = {
-                tokenAddress: token.address as `0x${string}`,
-                parsedAmount,
-                parsedCount,
-                isRandom,
-                pk,
-                restrictedTo,
-                duration,
-                msg: message || "Best Wishes",
-                answerHash,
-            };
-            setPendingCreateArgs(createArgs);
-
-            // 6. Approve TIP-20 token first
-            setStep('approving');
-            writeApprove({
-                address: token.address as `0x${string}`,
-                abi: ERC20_ABI,
-                functionName: 'approve',
-                args: [RED_PACKET_ADDRESS as `0x${string}`, parsedAmount],
-                chainId: CHAIN_ID,
-            });
-
-        } catch (e) {
-            console.error(e);
-            setStep('form');
+        if (mode === 'single') {
+            handleDirectSend();
+        } else {
+            handleCreateLink();
         }
     }
 
-    if (isSuccess) {
+    async function handleDirectSend() {
+        try {
+            if (!isAddress(recipient)) {
+                alert('Please enter a valid address');
+                return;
+            }
+            if (!amount || parseFloat(amount) <= 0) {
+                alert('Please enter a valid amount');
+                return;
+            }
+
+            await send(
+                recipient,
+                amount,
+                token.address,
+                token.decimals,
+                message || 'Red Pocket Gift 🧧'
+            );
+
+            // LocalStorage saving is handled in useSend or here if needed, 
+            // keeping consistent with previous logic
+            const savedPockets = JSON.parse(localStorage.getItem('my_pockets') || '[]');
+            const newPocket = {
+                id: Date.now().toString(), // Temp ID until txHash is confirmed in hook
+                amount: amount,
+                token: token.symbol,
+                recipient: recipient,
+                status: 'sent',
+                mode: 'single',
+                message: message,
+                createdAt: Date.now(),
+                txHash: null, // Hook handles this
+            };
+            savedPockets.unshift(newPocket);
+            localStorage.setItem('my_pockets', JSON.stringify(savedPockets));
+
+        } catch (e) {
+            console.error('Transfer error:', e);
+        }
+    }
+
+    async function handleCreateLink() {
+        const wallet = wallets.find((w) => w.address.toLowerCase() === walletAddress?.toLowerCase());
+        if (!wallet) {
+            console.error('Wallet not found for address:', walletAddress);
+            return;
+        }
+
+        setIsCreating(true);
+        try {
+            // Ensure we are on the correct chain
+            await wallet.switchChain(42431);
+
+            const provider = await wallet.getEthereumProvider();
+            const walletClient = createWalletClient({
+                account: walletAddress as Address,
+                chain: {
+                    id: 42431,
+                    name: 'Tempo Moderato',
+                    nativeCurrency: { name: 'AlphaUSD', symbol: 'aUSD', decimals: 6 },
+                    rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } },
+                },
+                transport: custom(provider),
+            });
+            const publicClient = createPublicClient({
+                chain: {
+                    id: 42431,
+                    name: 'Tempo Moderato',
+                    nativeCurrency: { name: 'AlphaUSD', symbol: 'aUSD', decimals: 6 },
+                    rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } },
+                },
+                transport: http(),
+            });
+
+            // Fetch current gas fees
+            // @ts-ignore
+            const fees = await publicClient.estimateFeesPerGas();
+            const gasPrice = fees.maxFeePerGas || undefined;
+            const priorityFee = fees.maxPriorityFeePerGas || undefined;
+
+            console.log("Fees:", fees);
+
+            // 1. Generate Ephemeral Key
+            const privateKey = generatePrivateKey();
+            const account = privateKeyToAccount(privateKey);
+            const signerPtr = account.address;
+
+            // 2. Approve Token
+            const amountBigInt = parseUnits(amount, token.decimals);
+
+            // Check allowance first? (Skipping for brevity, just approve)
+            const approveHash = await walletClient.writeContract({
+                address: token.address as Address,
+                abi: ERC20_ABI,
+                functionName: 'approve',
+                args: [RED_PACKET_ADDRESS, amountBigInt],
+                account: walletAddress as Address,
+                maxFeePerGas: gasPrice,
+                maxPriorityFeePerGas: priorityFee,
+            });
+            console.log('Approve Hash:', approveHash);
+            await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+            // 3. Create Packet
+            // Params: token, totalAmount, count, isRandom, signerPtr, restrictedTo(0), duration, message, answerHash(0)
+            const duration = 24 * 60 * 60; // 24 hours
+            const createHash = await walletClient.writeContract({
+                address: RED_PACKET_ADDRESS as Address,
+                abi: RedPacketABI,
+                functionName: 'createPacket',
+                args: [
+                    token.address,
+                    amountBigInt,
+                    BigInt(count),
+                    isRandom,
+                    signerPtr,
+                    '0x0000000000000000000000000000000000000000', // No restriction
+                    BigInt(duration),
+                    message || 'Red Pocket Gift 🧧',
+                    '0x0000000000000000000000000000000000000000000000000000000000000000', // No question
+                ],
+                account: walletAddress as Address,
+                maxFeePerGas: gasPrice,
+                maxPriorityFeePerGas: priorityFee,
+            });
+            console.log('Create Packet Hash:', createHash);
+
+            const receipt = await publicClient.waitForTransactionReceipt({ hash: createHash });
+
+            // Extract PacketId from logs
+            // Event PacketCreated(bytes32 indexed packetId, ...)
+            // The first topic is event signature, second is packetId (indexed)
+            const packetCreatedLog = receipt.logs.find(log => log.address.toLowerCase() === RED_PACKET_ADDRESS.toLowerCase());
+            if (!packetCreatedLog) throw new Error('Packet creation event not found');
+
+            const packetId = packetCreatedLog.topics[1];
+
+            // 4. Generate Link
+            // Encode packetId and privateKey to Base64 to make the link shorter
+            const shortPacketId = hexToBase64(packetId);
+            const shortPrivateKey = hexToBase64(privateKey);
+
+            const link = `${window.location.origin}/claim/${shortPacketId}#${shortPrivateKey}`;
+            setCreatedLink(link);
+
+            // Save to local storage
+            const savedPockets = JSON.parse(localStorage.getItem('my_pockets') || '[]');
+            const newPocket = {
+                id: packetId,
+                amount: amount,
+                token: token.symbol,
+                recipient: 'Multiple',
+                status: 'created',
+                mode: 'link',
+                message: message,
+                createdAt: Date.now(),
+                txHash: createHash,
+                link: link
+            };
+            savedPockets.unshift(newPocket);
+            localStorage.setItem('my_pockets', JSON.stringify(savedPockets));
+
+        } catch (e: any) {
+            console.error('Create Link Error:', e);
+            setCreateError(e.message || 'Failed to create Red Pocket');
+        } finally {
+            setIsCreating(false);
+        }
+    }
+
+    // Success screen for Link Mode
+    if (createdLink) {
+        return (
+            <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
+                <motion.div
+                    initial={{ scale: 0.8, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    className="bg-card w-full p-8 rounded-3xl border border-border/50 shadow-2xl relative overflow-hidden"
+                >
+                    <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-orange-500" />
+                    <div className="w-16 h-16 bg-green-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+                        <Gift className="w-8 h-8 text-green-500" />
+                    </div>
+
+                    <h2 className="text-2xl font-bold mb-2">Red Pocket Ready!</h2>
+                    <p className="text-muted-foreground mb-6">
+                        Share this link with your friends to claim.
+                    </p>
+
+                    <div className="bg-secondary/50 p-4 rounded-xl flex items-center gap-3 mb-6 border border-dashed border-border">
+                        <div className="bg-white p-2 rounded-lg">
+                            <Share2 className="w-5 h-5 text-black" />
+                        </div>
+                        <div className="text-left flex-1 overflow-hidden">
+                            <p className="text-xs text-muted-foreground truncate">
+                                {createdLink.split('#')[0]}<span className="text-muted-foreground/50">#SECRET_KEY_HIDDEN</span>
+                            </p>
+                        </div>
+                        <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => navigator.clipboard.writeText(createdLink)}
+                        >
+                            <Copy className="w-4 h-4" />
+                        </Button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 mb-6 text-sm text-left">
+                        <div className="bg-secondary/30 p-3 rounded-xl">
+                            <p className="text-muted-foreground text-xs">Total Amount</p>
+                            <p className="font-bold">{amount} {token.symbol}</p>
+                        </div>
+                        <div className="bg-secondary/30 p-3 rounded-xl">
+                            <p className="text-muted-foreground text-xs">Claims</p>
+                            <p className="font-bold">{count} People</p>
+                        </div>
+                    </div>
+
+                    <div className="flex gap-3">
+                        <Button
+                            className="flex-1" variant="outline"
+                            onClick={() => navigator.share?.({ title: 'Red Pocket', url: createdLink }).catch(() => { })}
+                        >
+                            Share System
+                        </Button>
+                        <Button
+                            className="flex-1"
+                            variant="premium"
+                            onClick={() => {
+                                setCreatedLink('');
+                                setAmount('');
+                                setMessage('');
+                                setMode('single'); // Reset to default
+                            }}
+                        >
+                            Create New
+                        </Button>
+                    </div>
+                </motion.div>
+            </div>
+        );
+    }
+
+    // Success screen for Direct Mode (using existing txHash logic from hook)
+    if (txHash && mode === 'single') {
         return (
             <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
                 <motion.div
@@ -223,58 +328,42 @@ export default function CreatePage() {
                         <CheckCircle className="w-8 h-8 text-green-500" />
                     </div>
 
-                    <h2 className="text-2xl font-bold mb-2">Packet Created!</h2>
-                    <p className="text-muted-foreground mb-8">
-                        {mode === 'single' ? `Sent ${amount} ${localStorage.getItem('pending_token')}...` : `Ready to share ${amount} ${localStorage.getItem('pending_token')}`}
+                    <h2 className="text-2xl font-bold mb-2">Sent Successfully!</h2>
+                    <p className="text-muted-foreground mb-6">
+                        {amount} {token.symbol} has been sent 🎉
                     </p>
 
-                    {mode === 'link' && (
-                        <div className="space-y-4">
-                            <div className="bg-secondary/50 p-3 rounded-xl break-all text-xs font-mono text-left relative group">
-                                {typeof window !== 'undefined' && createdPacketId &&
-                                    `${window.location.origin}/claim/${createdPacketId}#sk=${localStorage.getItem('pending_sk')}`
-                                }
-                                {!createdPacketId && "Generating Link (Wait for confirmation)..."}
-                                <Button variant="ghost" size="icon" className="absolute top-1 right-1 h-8 w-8">
-                                    <Copy className="w-4 h-4" />
-                                </Button>
-                            </div>
-                            <Button
-                                variant="premium"
-                                className="w-full h-12"
-                                onClick={() => {
-                                    if (createdPacketId) {
-                                        const url = `${window.location.origin}/claim/${createdPacketId}#sk=${localStorage.getItem('pending_sk')}`;
-                                        navigator.clipboard.writeText(url);
-                                        alert("Link Copied!");
-                                    } else {
-                                        alert("Please wait for transaction to confirm...");
-                                    }
-                                }}
-                            >
-                                <Share2 className="mr-2 w-4 h-4" /> Share Link
-                            </Button>
-                        </div>
-                    )}
-
-                    {mode === 'single' && (
-                        <div className="bg-secondary/30 p-4 rounded-xl mb-6">
-                            <p className="text-sm text-muted-foreground">Recipient can claim using the &quot;My Gifts&quot; tab or you can send them the link as a notify.</p>
-                        </div>
-                    )}
-
-                    <Link href="/create" onClick={() => window.location.reload()}>
-                        <Button variant="outline" className="w-full mt-4">Create Another</Button>
-                    </Link>
-
-                    <div className="mt-6 pt-6 border-t border-border/50">
-                        <p className="text-xs text-muted-foreground">Note: Retrieve the actual link from Dashboard if you missed it.</p>
+                    <div className="bg-secondary/50 p-3 rounded-xl break-all text-xs font-mono text-left mb-4">
+                        <p className="text-muted-foreground text-[10px] uppercase font-bold mb-1">Transaction Hash</p>
+                        {txHash}
                     </div>
+
+                    <a
+                        href={`https://explore.tempo.xyz/tx/${txHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        <Button variant="outline" className="w-full mb-3">
+                            <ExternalLink className="mr-2 w-4 h-4" /> View on Explorer
+                        </Button>
+                    </a>
+
+                    <Button
+                        variant="premium"
+                        className="w-full"
+                        onClick={() => {
+                            reset();
+                            setAmount('');
+                            setRecipient('');
+                            setMessage('');
+                        }}
+                    >
+                        Send Another
+                    </Button>
                 </motion.div>
             </div>
         )
     }
-
 
     if (!mounted) return (
         <main className="min-h-screen pb-20 p-4 max-w-lg mx-auto flex items-center justify-center">
@@ -285,8 +374,15 @@ export default function CreatePage() {
     return (
         <main className="min-h-screen pb-20 p-4 max-w-lg mx-auto">
             <Header />
-            <div className="mb-8 pt-4">
-                <h1 className="text-xl font-bold">Create Pocket</h1>
+            <div className="mb-6 pt-2">
+                <SegmentedControl
+                    options={[
+                        { label: 'Send Direct', value: 'single' },
+                        { label: 'Share Link', value: 'link' },
+                    ]}
+                    value={mode}
+                    onChange={setMode}
+                />
             </div>
 
             {!authenticated ? (
@@ -298,15 +394,6 @@ export default function CreatePage() {
                 </div>
             ) : (
                 <div className="space-y-6">
-                    {/* Mode Selection */}
-                    <SegmentedControl
-                        options={[
-                            { label: 'Share via Link', value: 'link' },
-                            { label: 'Send Direct', value: 'single' },
-                        ]}
-                        value={mode}
-                        onChange={setMode}
-                    />
 
                     {/* Token & Amount */}
                     <div className="bg-card p-6 rounded-3xl border border-border/50 shadow-lg space-y-6">
@@ -354,28 +441,32 @@ export default function CreatePage() {
                         ) : (
                             <div className="grid grid-cols-2 gap-4">
                                 <div>
-                                    <label className="text-sm text-muted-foreground ml-1 mb-2 block">Quantity</label>
-                                    <Input
-                                        type="number"
-                                        placeholder="10"
-                                        value={count}
-                                        onChange={e => setCount(e.target.value)}
-                                    />
+                                    <label className="text-sm text-muted-foreground ml-1 mb-2 block">People</label>
+                                    <div className="relative">
+                                        <Users className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                                        <Input
+                                            type="number"
+                                            value={count}
+                                            onChange={e => setCount(e.target.value)}
+                                            className="pl-9"
+                                            placeholder="5"
+                                        />
+                                    </div>
                                 </div>
                                 <div>
-                                    <label className="text-sm text-muted-foreground ml-1 mb-2 block">Type</label>
-                                    <div className="flex bg-secondary/50 rounded-lg p-1 h-10">
+                                    <label className="text-sm text-muted-foreground ml-1 mb-2 block">Mode</label>
+                                    <div className="flex bg-secondary/30 p-1 rounded-xl h-10">
                                         <button
-                                            className={`flex-1 rounded-md text-xs font-semibold transition-all ${splitType === 'equal' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}
-                                            onClick={() => setSplitType('equal')}
+                                            onClick={() => setIsRandom(true)}
+                                            className={`flex-1 flex items-center justify-center gap-1 text-xs font-medium rounded-lg transition-all ${isRandom ? 'bg-background shadow-sm text-primary' : 'text-muted-foreground'}`}
                                         >
-                                            Equal
+                                            <Shuffle className="w-3 h-3" /> Lucky
                                         </button>
                                         <button
-                                            className={`flex-1 rounded-md text-xs font-semibold transition-all ${splitType === 'random' ? 'bg-background shadow-sm' : 'text-muted-foreground'}`}
-                                            onClick={() => setSplitType('random')}
+                                            onClick={() => setIsRandom(false)}
+                                            className={`flex-1 flex items-center justify-center gap-1 text-xs font-medium rounded-lg transition-all ${!isRandom ? 'bg-background shadow-sm text-primary' : 'text-muted-foreground'}`}
                                         >
-                                            Random
+                                            <Settings2 className="w-3 h-3" /> Equal
                                         </button>
                                     </div>
                                 </div>
@@ -404,83 +495,33 @@ export default function CreatePage() {
                         />
                     </div>
 
-                    {/* Question & Answer (optional) */}
-                    <div className="bg-card p-6 rounded-3xl border border-border/50 shadow-lg space-y-4">
-                        <div className="flex items-center gap-2">
-                            <HelpCircle className="w-4 h-4 text-muted-foreground" />
-                            <label className="text-sm text-muted-foreground">Question & Answer (Optional)</label>
+                    {/* Sender Wallet Info */}
+                    {walletAddress && (
+                        <div className="bg-secondary/30 p-3 rounded-xl text-xs text-muted-foreground">
+                            <span className="font-semibold">Sending from: </span>
+                            <span className="font-mono">{walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</span>
                         </div>
-                        <Input
-                            placeholder="e.g. What is my cat's name?"
-                            value={question}
-                            onChange={e => setQuestion(e.target.value)}
-                        />
-                        {question.trim() && (
-                            <div>
-                                <label className="text-sm text-muted-foreground ml-1 mb-2 block">Answer (case-insensitive)</label>
-                                <Input
-                                    placeholder="e.g. Pamuk"
-                                    value={answer}
-                                    onChange={e => setAnswer(e.target.value)}
-                                />
-                            </div>
-                        )}
-                        {question.trim() && (
-                            <p className="text-xs text-muted-foreground">
-                                Claimers must answer correctly to receive funds. The answer is stored as a hash — never in plain text.
-                            </p>
-                        )}
-                    </div>
-
-                    {/* Advanced Toggle */}
-                    <div className="flex items-center justify-between px-2">
-                        <button
-                            className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-                            onClick={() => setShowAdvanced(!showAdvanced)}
-                        >
-                            <Settings2 className="w-4 h-4" /> Advanced Settings
-                        </button>
-                    </div>
-
-                    <AnimatePresence>
-                        {showAdvanced && (
-                            <motion.div
-                                initial={{ height: 0, opacity: 0 }}
-                                animate={{ height: 'auto', opacity: 1 }}
-                                exit={{ height: 0, opacity: 0 }}
-                                className="overflow-hidden"
-                            >
-                                <div className="bg-card p-6 rounded-3xl border border-border/50 space-y-4">
-                                    <label className="text-sm text-muted-foreground ml-1 block">Expiry</label>
-                                    <div className="flex gap-2">
-                                        {EXPIRY_OPTIONS.map(opt => (
-                                            <button
-                                                key={opt.value}
-                                                onClick={() => setExpiry(opt.value)}
-                                                className={`flex-1 py-3 rounded-xl text-sm font-semibold transition-all border ${expiry === opt.value ? 'bg-primary text-primary-foreground border-primary' : 'bg-secondary/30 border-transparent hover:bg-secondary/50'}`}
-                                            >
-                                                {opt.label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-                            </motion.div>
-                        )}
-                    </AnimatePresence>
+                    )}
 
                     {/* Submit */}
                     <Button
                         className="w-full h-16 text-lg rounded-2xl shadow-xl shadow-primary/20 hover:shadow-primary/40 transition-all font-bold"
                         variant="premium"
                         onClick={handleCreate}
-                        disabled={isWritePending || isConfirming || isApprovePending || isApproveConfirming || !amount || (mode === 'single' && !isAddress(recipient)) || (question.trim().length > 0 && answer.trim().length === 0)}
+                        disabled={isSending || isCreating || !amount || (mode === 'single' && !isAddress(recipient))}
                     >
-                        {isApprovePending ? 'Approve Token...' : isApproveConfirming ? 'Confirming Approve...' : isWritePending ? 'Confirm in Wallet...' : isConfirming ? 'Creating...' : `Put ${amount || '0'} ${token.symbol} in Pocket`}
+                        {isSending || isCreating ? (
+                            <span className="flex items-center gap-2">
+                                <Loader2 className="w-5 h-5 animate-spin" /> {isCreating ? 'Creating Pocket...' : 'Sending...'}
+                            </span>
+                        ) : (
+                            mode === 'single' ? `Send ${amount || '0'} ${token.symbol}` : `Create Red Pocket`
+                        )}
                     </Button>
 
-                    {writeError && (
-                        <p className="text-center text-sm text-red-500 bg-red-500/10 p-2 rounded-lg">
-                            {writeError.message.includes('User rejected') ? 'Transaction rejected' : 'Error creating packet'}
+                    {(sendError || createError) && (
+                        <p className="text-center text-sm text-red-500 bg-red-500/10 p-3 rounded-xl">
+                            {(sendError || createError).includes('User rejected') ? 'Transaction rejected' : (sendError || createError)}
                         </p>
                     )}
                 </div>
